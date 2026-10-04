@@ -1,183 +1,263 @@
-# Harvard FAS RC (Cannon / Kempner) — cheat sheet
+# Janelia Research Campus compute cluster (LSF) -- cheat sheet
 
-Cluster info for `rhakim`. 
-Docs: 
-- <https://docs.rc.fas.harvard.edu/>
-- Kempner: <https://handbook.eng.kempnerinstitute.harvard.edu/>
-- FAS: <https://docs.rc.fas.harvard.edu/kb/running-jobs/>, <https://docs.rc.fas.harvard.edu/kb/category/cluster-usage/>
+Cached summary of the HPC team's "AI Agent Hints" page, **last updated 2026-09-29**.
+Canonical, authoritative source: <https://hpc.int.janelia.org/docs/ai-agent-hints>
+(internal network / VPN). If this file is more than 30 days old, fetch the live page:
+queue limits, runtime caps, GPU fleet and prices change through the year.
 
-## Accounts
+Contact: clusteradmins@janelia.hhmi.org. Helpdesk via IT Services.
 
-| Account | Partitions | Notes |
-|---|---|---|
-| `kempner_rhakim_lab` | all `kempner*` | Default for GPU work |
-| `kempner_bsabatini_lab` | all `kempner*` | Larger lab shares |
-| `kempner_konkle_lab` | all `kempner*` | Larger lab shares |
-| `kempner_ba_lab` | all `kempner*` | Larger lab shares |
-| `rhakim_lab` | all FAS partitions | Only working FAS account |
+## Cluster identity
 
-Fairshare: default to `kempner_rhakim_lab`. Slowdown below ~0.7; hard to allocate below ~0.5. Check: `sshare -U`.
+| Item | Value |
+|---|---|
+| Scheduler | IBM Spectrum LSF 10.1 (not Slurm / PBS / SGE / Kubernetes) |
+| OS | RHEL 9.8 on all nodes |
+| CUDA | 13.3 default at `/usr/local/cuda`; `/usr/local/cuda-11`, `/usr/local/cuda-12` also present on compute nodes (not login nodes) |
+| Containers | Apptainer 1.4.x for trusted images (`--nv` for GPU). Docker does not exist. Rootless podman only with a per-user subuid range from the HPC team. |
+| Storage | NFS-based (PRFS primary, NRS non-redundant). No parallel filesystem. |
+| Interconnect | Ethernet everywhere; InfiniBand only on H100/H200 (400 Gbit NDR) and B300 (800 Gbit XDR) nodes, and only across nodes of the same generation. |
+| Billing | $0.05 per slot-hour plus a per-GPU rate; charged from start to end, failed and killed jobs included. Cycle: 15th to 14th. |
 
-## Tips
+Dashboards (internal network): cluster status <https://cluster-status.int.janelia.org>, GPU utilisation <https://gpustats.int.janelia.org>, RTM job monitoring <https://lsf-rtm.int.janelia.org>, storage usage <https://storage-usage.int.janelia.org>, Starfish <https://starfish.int.janelia.org>, wiki <https://hpc.int.janelia.org>.
 
-- Allocation typically takes around 10-60 seconds at best, and much slower at worst. Plan to batch jobs if runtime is on the order of allocation time.
+## Critical rules
 
-## Kempner
+Always:
+- Submit all computation as LSF jobs with `bsub`, even small tasks. Login nodes (`login1`, `login2`) and the submit host (`submit.int.janelia.org`, 1 core / 16 GB shared) are for `bsub`/`bjobs` and light orchestration only.
+- Set `-W` on every job. Defaults without it: 14 d on `local`, 8 h on `interactive`, **2 h on named GPU queues**.
+- Size with the slot model (below). Jobs exceeding their memory are killed with no recovery.
+- Use `-o` and `-e` (with `%J`, and `%I` for arrays) so LSF does not e-mail per job. `-o /dev/null` if the code saves its own results.
+- `bkill` interactive and GPU jobs when done.
+- Clean up `/scratch/$USER/` before the job ends (node-local SSD, swept periodically, ~25 GB per slot).
+- Irreplaceable data on PRFS (`/groups/...`), nightly backups, 30-day retention.
+- `module load` for software, especially MATLAB (hardcoded `/misc/local/matlab-*/bin/matlab` paths leave orphaned daemons).
+- Check RTM after test runs and right-size.
+- Set threading env vars in every Python/ML job (see below).
+- **Sandbox unsupervised agentic loops** (required since 2026-08-28): bwrap when no GPU, rootless podman when GPU; never Apptainer for this. Examples: <https://github.com/JaneliaScientificComputingSystems/agentic-sandbox>.
 
-### Partitions
+Never:
+- Run computation, compiles, `pip install`, `conda create` or heavy file operations on login nodes or the submit host.
+- Submit more than 15,000 jobs at once; use array jobs.
+- `watch bjobs` with short intervals; `watch -n 60 bjobs` at minimum, RTM preferred.
+- Use `/tmp` on compute nodes; use `/scratch/$USER/`.
+- VS Code Remote SSH to compute or login nodes; use NoMachine + interactive job, or code-server as a job.
+- Put passwords, tokens or usernames in job names (`bjobs -u all` shows them to everyone).
+- Assume a program is parallel; 48 slots do not speed up single-threaded code.
+- Set `CUDA_VISIBLE_DEVICES` in job scripts; LSF sets it (`$CUDA_VISIBLE_DEVICES_ORIG` holds host IDs).
+- Submit partial-node jobs to `*_parallel` queues.
+- SSH to compute nodes to poll `nvidia-smi` or jobs. One-off human debugging on a node is fine; scripted polling is not.
 
-All four main GPU partitions share a **2-day max wall** and the `kempner_base` QOS.
+## Slot model
 
-| Partition | GPU/node | Cores/node | RAM/node | Max wall |
+1 slot = 1 physical core + fixed RAM:
+
+| Queue family | RAM per slot |
+|---|---|
+| CPU queues, `gpu_l4*`, `gpu_rtx6000`, `gpu_short` | 15 GB |
+| `gpu_a100`, `gpu_h100`, `gpu_h200`, `gpu_b300` | 40 GB |
+
+slots = max(cores needed, ceil(RAM_GB / RAM_per_slot)). Cores and memory cannot be requested separately. Examples at 15 GB/slot: 4 cores + 30 GB -> `-n 4`; 2 cores + 100 GB -> `-n 7`; 16 cores + 500 GB -> `-n 34`. At 40 GB/slot: 4 cores + 100 GB -> `-n 4`; 2 cores + 200 GB -> `-n 5`.
+
+Hyperthreading is on, so the OS shows 2x the physical cores. LSF slots map to physical cores; do not read `lscpu` and assume more are available, and do not thread to logical cores.
+
+`$LSB_DJOB_NUMPROC` = slots allocated. Use it for thread counts.
+
+## CPU queues
+
+| Queue | Max runtime | Default runtime | Per-user limit | Notes |
 |---|---|---|---|---|
-| `kempner` | 4× A100 40G | 64 | ~1 TB | 2d |
-| `kempner_h100` | 4× H100 80G | 96 | ~1.5 TB | 2d |
-| `kempner_h200` | 4× H200 141G | 64 | ~1.5 TB | 2d |
-| `kempner_rtx` | 8× RTX PRO 6000 96G | 128 | ~1.5 TB | 2d |
-| `kempner_requeue` | mixed (A100/H100/H200/RTX) | varies | varies | 2d (preemptible) |
-| `kempner_interactive` | A100 MIG 3g.20gb (8 slices/node) | 64 | ~1 TB | 8h |
+| `short` | 1 h | 1 h | none | Jobs with `-W <= 60` auto-route here. Best turnaround. |
+| `local` | 14 d | 14 d | 5,999 slots | Default batch queue. |
+| `interactive` | 48 h | 8 h | 128 slots or 4 jobs | `bsub -Is /bin/bash`; GUI apps and testing. |
+| `cpu_parallel` | 14 d | -- | -- | Multi-node MPI, whole nodes (128 slots) only. |
 
-GPU picking: **A100** for small/proto & max software compatibility; **H100/H200** for large-scale training/inference (FP8, NVLink); **H200** for the largest/long-context models (141 GB, highest bandwidth); **RTX** for FP4 / rendering / RL (8/node, PCIe not NVLink — weaker multi-GPU sharding). Precision: FP8 on H100/H200/RTX; FP4 on RTX only.
+## GPU queues
 
-Relative single-GPU throughput (Kempner's BF16-training benchmark, ~1B transformer): **A100 ≈ 1× · RTX ≈ 1.4× · H100 ≈ 2.4× · H200 ≈ 2.6×**. Memory bandwidth: H200 ~40% > H100, ~3× A100/RTX. Cross against the billing table below for perf-per-fairshare — RTX is the cheapest *and* ~1.4× an A100. Full benchmarks: "Choosing a GPU partition" (Docs).
+| Queue | GPU | $/GPU/h | GPUs/node | Slots/GPU | Node slots | RAM/slot | VRAM |
+|---|---|---|---|---|---|---|---|
+| `gpu_l4` | L4 | 0.10 | 8 | 8 | 64 | 15 GB | 24 GB |
+| `gpu_l4_16` | L4 | 0.10 | 8 | 16 | 128 | 15 GB | 24 GB |
+| `gpu_l4_large` | L4 | 0.10 | 1 | 64 | 64 | 15 GB | 24 GB |
+| `gpu_a100` | A100 | 0.20 | 4 | 12 | 48 | 40 GB | 80 GB |
+| `gpu_rtx6000` | RTX PRO 6000 | 0.50 | 8 | 16 | 128 | 15 GB | 96 GB |
+| `gpu_h100` | H100 | 0.65 | 8 | 12 | 96 | 40 GB | 80 GB |
+| `gpu_h200` | H200 | 0.80 | 8 | 12 | 96 | 40 GB | 141 GB |
+| `gpu_b300` | B300 | 2.40 | 8 | 12 | 96 | 40 GB | 268 GB |
+| `gpu_short` | any | 0.10 | varies | varies | varies | 15 GB | varies |
 
-Per-GPU share — request this much cores/RAM for *each* GPU you request: `kempner` 16c / 240G · `kempner_h100` 24c / 360G · `kempner_h200` 16c / 360G · `kempner_rtx` 16c / 180G. These are just the node's cores and RAM split across its GPUs (cores = cores÷GPUs exactly; RAM ≈ node RAM÷GPUs, rounded down for OS overhead), so *k* GPUs → *k*× these values = *k*/(GPUs-per-node) of the node. The scheduler doesn't enforce this (only the 16-GPU/user QOS cap is hard), but overshooting your share strands the node's other GPUs — they can't be allocated to anyone else.
+- GPU queues default to **2 h** without `-W`; max 14 d. `gpu_short` hard 1 h limit, any GPU type (size slots for the smallest ratio, 8).
+- `bsub -gpu "num=N"` needs an explicit `-q gpu_*`; it does not infer one.
+- Per-user GPU limit is about 50% of each queue.
+- Parallel variants (`gpu_l4_parallel`, `gpu_a100_parallel`, `gpu_h100_parallel`, `gpu_h200_parallel`, `gpu_b300_parallel`): whole nodes, relaxed fencing, `-app parallel-<slots>`, `-gpu "num=<GPUs per node>"` is per host.
 
-### Limits
+Choosing: start with `gpu_l4`. Move up only for >24 GB VRAM, NVLink or multi-GPU in a node. `gpu_l4_large` / `gpu_l4_16` when CPU/memory-bound with occasional GPU use. Single-node fine-tuning or inference: `gpu_rtx6000` if the model fits in 96 GB (no NVLink, no IB, native FP4), `gpu_a100` for NVLink within a node. Multi-node: `gpu_h100` / `gpu_h200` (`_parallel`). Largest models, Blackwell-native FP4/FP8 kernels (e.g. Kimi-K3): `gpu_b300`. FP64: H200 > H100 > A100, never B300. Check bf16 before requesting a bigger GPU; fp32 on a B300 uses ~2% of its compute.
 
-- **16 GPUs per user**, aggregated across `kempner` + `kempner_h100` + `kempner_h200` + `kempner_rtx` (QOS `kempner_base`, `MaxTRESPU=gres/gpu=16`).
-- **96 GPUs per account** (`GrpTRES`; `kempner_undergrads` = 4).
-- 1 GPU per user on `kempner_interactive`.
-- To exceed caps: use `kempner_requeue` (preemptible), shorten runtimes, or request a reservation via Cluster Governance. Monopolizing gets jobs killed without notice and fairshare cut.
-- For sweeps: `--array=0-N%15` to keep one slot free.
+Slot-to-GPU ratio: requesting more slots than the ratio strands GPUs for other users (`-n 24 -gpu "num=1"` on `gpu_l4` holds 3 GPUs' worth of slots). Fewer is fine for GPU-bound code.
 
-### `#SBATCH` header templates (one per partition)
+## bsub templates
 
-Copy or adapt the block below matching the GPU you want into your worker `.sh` header. Each block requests **one GPU's share** of the node (1/4 node on A100/H100/H200, 1/8 on RTX — 8 GPUs/node); for *N* GPUs, set `--gres=gpu:N` and scale `-c`/`--mem` by *N*. `G` vs `M` suffix both fine; stay at/under the per-GPU share above.
-
-**`kempner` — 1× A100**
 ```bash
-#SBATCH --partition=kempner
-#SBATCH --account=kempner_rhakim_lab
-#SBATCH --gres=gpu:1
-#SBATCH -c 16
-#SBATCH --mem=240G
-#SBATCH --time=1-00:00:00
+# CPU batch
+bsub -n 4 -W 2:00 -q local -J myjob -o logs/out_%J.log -e logs/err_%J.log bash run_my.sh <args>
+
+# Quick CPU test (auto-routes to short when -W <= 60)
+bsub -n 2 -W 0:30 -J smoke -o logs/smoke_%J.log bash run_my.sh <args>
+
+# 1x L4 GPU, 2 h
+bsub -n 8 -gpu "num=1" -q gpu_l4 -W 2:00 -J train -o logs/train_%J.log -e logs/train_%J.err bash run_my.sh <args>
+
+# 2x A100 with the standard ratio
+bsub -n 24 -gpu "num=2" -q gpu_a100 -W 8:00 -J train2 -o logs/train2_%J.log bash run_my.sh <args>
+
+# Interactive CPU shell on a compute node (install packages, debug)
+bsub -n 4 -W 1:00 -Is /bin/bash
+
+# Interactive GPU session
+bsub -n 8 -gpu "num=1" -q gpu_l4 -W 4:00 -Is /bin/bash
+
+# Array job: 1000 tasks, 15 concurrent, 1-based $LSB_JOBINDEX
+bsub -n 1 -W 1:00 -J "sweep[1-1000]%15" -o "logs/sweep_%J_%I.log" bash run_array.sh /groups/<lab>/project/runs/table.tsv
+
+# Multi-node GPU (2 nodes x 8 H100)
+bsub -n 192 -app parallel-96 -q gpu_h100_parallel -gpu "num=8:mode=shared" -W 24:00 mpirun -np 16 --map-by ppr:8:node ./gpu_app
+
+# MATLAB batch
+module load matlab && bsub -n 4 -W 2:00 -o output.log matlab -nojvm -batch "my_script;"
 ```
 
-**`kempner_h100` — 1× H100**
+Array worker skeleton (row `N` of a TSV, columns: name, arg_a, dir_save):
+
 ```bash
-#SBATCH --partition=kempner_h100
-#SBATCH --account=kempner_rhakim_lab
-#SBATCH --gres=gpu:1
-#SBATCH -c 24
-#SBATCH --mem=360G
-#SBATCH --time=1-00:00:00
+TABLE=$1
+IFS=$'\t' read -r RUN_NAME ARG_A DIR_SAVE < <(sed -n "${LSB_JOBINDEX}p" "$TABLE")
 ```
 
-**`kempner_h200` — 1× H200** (141 GB VRAM, highest bandwidth)
+Most users should **not** pass `-P`; LSF assigns the project from the user. `lsfgroup <username>` shows the default.
+
+## Environment variables inside a job
+
+| Variable | Contents |
+|---|---|
+| `LSB_JOBID` | Job ID |
+| `LSB_JOBINDEX` | Array task index (1-based) |
+| `LSB_DJOB_NUMPROC` | Slots allocated |
+| `LSB_JOBNAME` | Name from `-J` |
+| `LSB_BATCH_JID` | Combined ID, e.g. `13234[3]` |
+| `CUDA_VISIBLE_DEVICES` | GPUs assigned by LSF; read, never write |
+
+## Threading
+
+Set all of these in the job script; unset, each library spawns node-core-count threads per process. Layered threading multiplies (framework threads x BLAS threads), so size so that total <= slots:
+
 ```bash
-#SBATCH --partition=kempner_h200
-#SBATCH --account=kempner_rhakim_lab
-#SBATCH --gres=gpu:1
-#SBATCH -c 16
-#SBATCH --mem=360G
-#SBATCH --time=1-00:00:00
+export OMP_NUM_THREADS=$LSB_DJOB_NUMPROC
+export MKL_NUM_THREADS=$LSB_DJOB_NUMPROC
+export OPENBLAS_NUM_THREADS=$LSB_DJOB_NUMPROC
+export TBB_NUM_THREADS=$LSB_DJOB_NUMPROC
+export OPENMP_NUM_THREADS=$LSB_DJOB_NUMPROC
+export NUM_MKL_THREADS=$LSB_DJOB_NUMPROC
+# PyTorch DataLoader workers x threads per worker <= $LSB_DJOB_NUMPROC
 ```
 
-**`kempner_rtx` — 1× RTX PRO 6000 Blackwell** (96 GB, 8/node, PCIe, FP4-capable). Now the **cheapest GPU** for fairshare (see below).
-```bash
-#SBATCH --partition=kempner_rtx
-#SBATCH --account=kempner_rhakim_lab
-#SBATCH --gres=gpu:1
-#SBATCH -c 16
-#SBATCH --mem=180G
-#SBATCH --time=1-00:00:00
-```
+## Storage
 
-**`kempner_requeue`** — preemptible; pin GPU type with `--constraint` (features: `a100`, `h100`, `h200`, `rtx6000pro`, `a100-mig`). Size cores/mem to the chosen hardware.
-```bash
-#SBATCH --partition=kempner_requeue
-#SBATCH --account=kempner_rhakim_lab
-#SBATCH --constraint=h200
-#SBATCH --gres=gpu:1
-#SBATCH -c 16
-#SBATCH --mem=360G
-#SBATCH --time=1-00:00:00
-#SBATCH --requeue
-```
-
-## FAS / Cannon
-
-Account: `rhakim_lab`. No hard per-user CPU/memory/job caps on production partitions.
-
-### Partitions
-
-| Partition | Cores/node | RAM/node | GPU/node | Max wall | Notes |
+| Tier | Path | Backed up | $/TB/mo | Cluster access | Use |
 |---|---|---|---|---|---|
-| `sapphire` | 112 | ~1 TB | — | 3d | Preferred CPU. ≤64c for fast scheduling. |
-| `shared` | 48 | ~184 GB | — | 3d | General CPU |
-| `serial_requeue` | mixed | varies | mixed | 3d | Preemptible, 50% fairshare cost |
-| `gpu` | 64 | ~990 GB | 4× A100-80GB | 3d | sinfo: 1031177 MB/node. No enforced per-GPU split. |
-| `gpu_h200` | 112 | ~1 TB | 4× H200 | 3d | sinfo: 1031252 MB/node. |
-| `gpu_requeue` | mixed | varies | mixed | 3d | Preemptible GPU, 50% cost |
-| `bigmem` | 112 | ~2 TB | — | 3d | Only when >1 TB RAM needed |
-| `intermediate` | 112 | ~1 TB | — | 14d | Must request >3d walltime |
-| `unrestricted` | 48 | ~184 GB | — | 365d | No uptime guarantee |
-| `test` / `gpu_test` | varies | varies | varies | 12h | 5 / 2 jobs, 112 / 64 CPUs max |
+| PRFS | `/groups/<lab>/...` | nightly, 30 d | 12 (1 TB free per lab) | yes | active data, home dirs, irreplaceable files |
+| NRS | `/nrs/<lab>/...` | no | 10 | yes | reproducible or temporary data |
+| nearline | `/nearline/<lab>/...` | nightly, 30 d | 3 | **no** (desktops, `dtn.int.janelia.org`) | cold archive |
+| scratch | `/scratch/$USER/` | no (node-local SSD) | free | job's node only | temp files during a job |
+| misc/public | `/misc/public/` | no, purged after 30 d | free | yes | short-term sharing |
 
-### SBATCH block
+Home: `/groups/<groupname>/home/<username>`. Quotas are hard limits in 5 TB steps. POSIX permissions only, default umask 022; `umask 002` in job scripts for group write. `sudo` does nothing on network storage.
 
-**`sapphire` — CPU.** Full node `-c 112 --mem=990G` rarely schedules; stay ≤64c.
+Transfers: from a Mac mount `smb://prfs.hhmi.org/<lab>/...` (NRS: `nrs.hhmi.org`) and copy directly; do not route through login nodes. Inside Janelia `rsync`/`cp` as a job if it is not near-instant; >500 GB or >10,000 files: Globus or a helpdesk ticket.
+
+## Monitoring
+
 ```bash
-#SBATCH --partition=sapphire
-#SBATCH --account=rhakim_lab
-#SBATCH -c 8
-#SBATCH --mem=32G
-#SBATCH --time=0-12:00:00
+bjobs                         # your jobs
+bjobs -l <jobid>              # details incl. GPU assignment; works ~7 days after completion, prefer over bhist/bacct
+bjobs -u all                  # everyone
+bjobs ID1 ID2 ID3             # one call for many jobs (do this, not one call per job)
+bjobs <arrayid>               # all elements of an array in one call
+bqueues / bhosts              # queue state, host availability
+bpeek <jobid>                 # live stdout/stderr
+bkill <jobid> ; bkill -J "prefix*" ; bkill 0   # one, a named sweep, everything
+lsload -gpuload <hostname>    # GPU use on a node, from a login node, <= every 10-15 s
 ```
 
-**`gpu` — 1× A100-80GB.** Unlike Kempner, FAS docs do NOT enforce a per-GPU memory split — request what the app actually needs, not 1/Ngpu of the node. Check actual peak with `seff <jobid>`
-after a run.
+`bhist` / `bacct` scan ~149 M records: slow, submit them as jobs, only for jobs older than 7 days.
+
+Polling schedule (agent-driven monitoring must follow it):
+- Pending: first check after ~1 min, then 2, 4, 8 min... never under 1 min.
+- Running: wait about half the walltime, then halve the remaining time each check, never under 1 min.
+- Consolidate: one `bjobs` call for all tracked jobs at the soonest next-check time.
+
+RTM is the right-sizing tool: max memory used vs reserved, job efficiency (CPU vs slots), minute-by-minute graphs.
+
+## Slurm -> LSF translation
+
+| Slurm | LSF |
+|---|---|
+| `sbatch script.sh` | `bsub < script.sh` (parses `#BSUB`) or `bsub ./script.sh` (argv only) |
+| `srun --pty bash` | `bsub -Is /bin/bash` |
+| `squeue` / `squeue -u all` | `bjobs` / `bjobs -u all` |
+| `scancel JOBID` | `bkill JOBID` |
+| `sinfo` | `bhosts`, `bqueues` |
+| `sacct` | RTM, or `bhist` |
+| `--cpus-per-task` + `--mem` | `-n <slots>` (atomic core+RAM unit) |
+| `--gres=gpu:N` | `-gpu "num=N" -q gpu_*` |
+| `--time` | `-W H:MM` |
+| `--array=0-99%15` | `-J "name[1-100]%15"` (1-based) |
+| `$SLURM_ARRAY_TASK_ID` | `$LSB_JOBINDEX` |
+| `$SLURM_CPUS_PER_TASK` | `$LSB_DJOB_NUMPROC` |
+
+## Containers (trusted images, not agent sandboxes)
+
 ```bash
-#SBATCH --partition=gpu
-#SBATCH --account=rhakim_lab
-#SBATCH --gres=gpu:1
-#SBATCH -c 16
-#SBATCH --mem=120G
-#SBATCH --time=0-04:00:00
+apptainer exec --nv --bind /groups/mylab:/data:ro /misc/local/singularity/pytorch_25.09-py3.sif python train.py
+apptainer build my_container.sif docker://nvcr.io/nvidia/pytorch:24.01-py3
 ```
 
-## Fairshare & billing
+`--nv` is required for GPU. Home, `/tmp` and `/scratch` are auto-mounted. Pre-built: `/misc/local/singularity/pytorch_25.09-py3.sif`, `tensorflow_25.02-tf2-py3.sif`. Pre-downloaded models under `/misc/hf/<org>/<model>`.
 
-`f = 2^(-EffectiveUsage/NormShares)`. 3-day half-life. Check: `sshare -U`. Score 1.0 = unused (top priority), 0.5 = fair share, <0.5 = overusing (longer waits, never blocked).
+## NCCL / multi-node
 
-| Resource | Billing weight |
-|---|---|
-| Cascade Lake CPU | 1.0 (baseline) |
-| Sapphire Rapids CPU | 0.6 |
-| A100 GPU (`kempner`) | 209 / GPU |
-| H100 GPU (`kempner_h100`) | 547 / GPU |
-| H200 GPU (`kempner_h200`) | 547 / GPU |
-| RTX6000 GPU (`kempner_rtx`) | 21 / GPU — cheapest |
+```bash
+# H100 / H200 / B300: InfiniBand present, leave enabled
+export NCCL_BUFFSIZE=8388608
+# A100 / L4 / RTX 6000 Pro: Ethernet only
+export NCCL_IB_DISABLE=1 NCCL_NET_GDR_LEVEL=0 NCCL_BUFFSIZE=8388608
+export RAY_TMPDIR="/scratch/$(whoami)/ray_$(whoami)"
+```
 
-Requeue partitions bill at 50%.
+Recipes: <https://github.com/JaneliaScientificComputingSystems/gpu-cluster-recipes>. Always-on model serving (Kimi-K3 endpoint behind LiteLLM with a Haiku-based safeguard, everything logged): request a key from clusteradmins.
 
-**Total billing at the per-GPU share** (1 GPU + its cores/RAM): `kempner_rtx` ≈ **68**, `kempner` (A100) ≈ 245, `kempner_h200` ≈ 566, `kempner_h100` ≈ 575. RTX is by far the cheapest — its low GPU weight (21) dominates and memory is cheap. Same 4c/64G request: RTX bills ~35 vs H100 ~551 (≈16×). Prefer `kempner_rtx` for fairshare when the RTX PRO 6000 fits the job.
+## Agentic sandbox command reference
 
-## General limits
+Repo: <https://github.com/JaneliaScientificComputingSystems/agentic-sandbox>. Clone to shared storage so compute nodes see it. Both wrappers live in `scripts/`, resolve their helpers from their own location, and always bind the toolchain read-only plus `$PWD` read-write; `$HOME` only if explicitly requested (never do that).
 
-| Limit | Value |
-|---|---|
-| Jobs per account | 10,100 (recommend ≤1,000 at once) |
-| Array max index | 10,000 |
-| Login nodes | 1 core, 4 GB (cgroup-killed) |
-| Min job runtime | 10 min |
-| sbatch rate | ≥0.5s between calls |
+```
+sandbox-run.sh [options] -- <command...>     # bwrap, no GPU (default choice)
+podman-run.sh  [options] -- <command...>     # podman + NVIDIA CDI, GPU-capable
+  --ro PATH      read-only bind (repeatable)
+  --rw PATH      read-write bind (repeatable)
+  --allow HOST   allowed egress host (repeatable); omit for no network at all
+  --scratch      --rw /scratch/$USER
+  --claude       bind ~/.claude, ~/.claude.json and the CLI install (claude auth login first)
+  --opencode     bind opencode's four XDG state dirs (one such sandbox per account at a time)
+  --gpu          podman only: --device nvidia.com/gpu=all
+  --image NAME   podman only: default ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest
+                 (CUDA base + Node + Claude Code + opencode, 1.24 GB); -gpu:latest has PyTorch
+  --keep-id      podman only: run as your real uid/gid (needs a subuid range wider than your GID)
+```
 
-`scancel -n <prefix>` cancels a named sweep.
+Hosts to allow: Claude Code `api.anthropic.com`, `claude.ai`, `platform.claude.com`; opencode + Kimi K3 `litellm.int.janelia.org`. Nothing for pure compute.
 
-## Docs
+Facts verified by the HPC team (see `ADMIN-NOTES.md` in the repo): LSF cgroup limits apply unchanged inside the sandbox; `bkill` kills the whole tree; bwrap needs `user.max_user_namespaces > 0`; bwrap masks `.ssh`, `.aws`, `.azure`, `.kube`, `.config/gcloud`, `.docker`, `.git-credentials`, `.npmrc`, `.pypirc`, `.netrc`, `.env*` wherever they appear, podman cannot mask anything; podman storage must be pointed at `/scratch/$USER` once per user (`~/.config/containers/storage.conf`) and needs a subuid/subgid range from the HPC team; `bsub -gpu` needs an explicit GPU queue; backgrounded helpers can outlive a job that ends normally, both wrappers clean theirs up.
 
-- FASRC: [Running Jobs](https://docs.rc.fas.harvard.edu/kb/running-jobs/) · [Fairshare](https://docs.rc.fas.harvard.edu/kb/fairshare/) · [Kempner partitions](https://docs.rc.fas.harvard.edu/kb/kempner-partitions/) · [GPU computing](https://docs.rc.fas.harvard.edu/kb/gpgpu-computing-on-the-cluster/)
-- Kempner: [Overview](https://handbook.eng.kempnerinstitute.harvard.edu/s1_high_performance_computing/kempner_cluster/overview_of_kempner_cluster.html) · [Responsible use](https://handbook.eng.kempnerinstitute.harvard.edu/s1_high_performance_computing/kempner_cluster/kempner_policies_for_responsible_use.html) · [Advanced SLURM](https://handbook.eng.kempnerinstitute.harvard.edu/s1_high_performance_computing/general_hpc_concepts/advanced_slurm_features.html) · [Choosing a GPU partition](https://handbook.eng.kempnerinstitute.harvard.edu/technical_blog/choosing_gpu_partition.html) (benchmarks + workload guide)
+## Billing example
+
+`-n 12 -gpu "num=1" -q gpu_h100` for 10 h: slots 12 x 10 x 0.05 = $6.00, GPU 1 x 10 x 0.65 = $6.50, total $12.50. Accurate `-W` and killing idle interactive jobs is what keeps this down.
