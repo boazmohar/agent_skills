@@ -57,6 +57,9 @@ rcParams.update({
     'font.family': 'Arial',
     'svg.fonttype': 'none', ## critical for editable text in Illustrator
     'pdf.fonttype': 42, ## TrueType — critical for editable text in PDF/Illustrator
+    'mathtext.fontset': 'custom', ## math text (r$^2$, $10^6$) in Arial too, else it is set in DejaVu Sans
+    'mathtext.rm': 'Arial', 'mathtext.it': 'Arial:italic', 'mathtext.bf': 'Arial:bold',
+    'mathtext.default': 'regular',
     'font.size': 8,
     'axes.labelsize': 8,
     'xtick.labelsize': 8,
