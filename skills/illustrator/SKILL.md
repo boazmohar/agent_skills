@@ -46,7 +46,36 @@ ExtendScript is ES3 — `var` only, no arrow functions, no template literals, no
 osascript -e 'tell application "Adobe Illustrator" to open POSIX file "/path/to/file.ai"'
 ```
 
-Works for `.ai`, `.svg`, `.pdf`, `.eps`.
+Works for `.ai`, `.svg`, `.pdf`, `.eps`. Illustrator refuses to open a file that is
+already open (it just activates the tab); close the stale copy first. A document's
+`saved` property is `false` once the user has edited it, so only close documents
+with `saved == true` when refreshing re-rendered figures:
+
+```javascript
+for (var i = app.documents.length - 1; i >= 0; i--) {
+    if (app.documents[i].saved) app.documents[i].close(SaveOptions.DONOTSAVECHANGES);
+}
+```
+
+### matplotlib figures: open the PDF, not the SVG
+
+Both carry editable text when saved with `svg.fonttype: none` and `pdf.fonttype: 42`,
+but the SVG import raises the dialog "Clipping will be lost on roundtrip to Tiny"
+(matplotlib's clip paths) on every open, while the PDF imports silently with the
+clipping masks intact. Treat the PDF as the Illustrator master.
+
+### Missing-font dialog from matplotlib math text
+
+matplotlib sets math text (`r$^2$`, `$10^6$`) in DejaVu Sans regardless of
+`font.family`, so Illustrator reports DejaVu Sans missing even in an all-Arial figure.
+Add to the rcParams baseline (see the figure-formatting skill):
+
+```python
+"mathtext.fontset": "custom", "mathtext.rm": "Arial", "mathtext.it": "Arial:italic",
+"mathtext.bf": "Arial:bold", "mathtext.default": "regular",
+```
+
+Verify with `pdffonts figure.pdf` (poppler) or by grepping the SVG for `font-family`.
 
 ## Exporting PDFs for LaTeX embedding
 
